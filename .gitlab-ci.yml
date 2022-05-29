@@ -1,0 +1,145 @@
+stages:
+  - building
+  - testing
+  - scanning
+  - staging
+  - deploying
+
+image: lorisleiva/laravel-docker:latest
+
+variables:
+  MYSQL_DATABASE: crud-cursos
+  MYSQL_ROOT_PASSWORD: ''
+  MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+  DB_USERNAME: root
+  DB_PASSWORD: ''
+  DB_HOST: 'mysql'
+
+composer:
+
+  stage: building
+
+  services:
+    - mysql:latest
+  
+  script:
+      - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+      - cp .env.example .env
+      - php artisan key:generate
+      - php artisan route:clear
+      - php artisan migrate
+
+  artifacts:
+
+      expire_in: 1 month
+
+      paths:
+      - vendor/
+
+  cache:
+
+      key: ${CI_COMMIT_REF_SLUG}-composer
+    
+
+npm:
+
+  stage: building
+
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-npm
+    paths:
+      - node_modules/
+
+  script:
+      - npm install
+      - npm run production
+  
+
+phpcpd:
+  stage: testing
+  script:
+    - test -f phpcpd.phar || curl -L https://phar.phpunit.de/phpcpd.phar -o phpcpd.phar
+    - php phpcpd.phar app/ --min-lines=50
+  dependencies: []
+  cache:
+    paths:
+      - phpcpd.phar
+      
+
+phpunit:
+  stage: testing
+  # List of jobs from which it will download the artifacts.
+  dependencies:
+    - composer
+  script:
+    - phpunit --coverage-text --colors=never
+    - vendor/bin/phpunit --log-junit report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+  allow_failure: true
+
+codestyle:
+  stage: testing
+  dependencies: []
+  script:
+    - phpcs --standard=PSR2 --extensions=php --ignore=app/Support/helpers.php app
+  allow_failure: true
+
+
+owasp_dependency_check:
+  image:
+      name: registry.gitlab.com/gitlab-ci-utils/docker-dependency-check:latest
+      entrypoint: [""]
+  stage: scanning
+  script:
+      # Job will scan the project root folder and fail if any vulnerabilities with CVSS > 0 are found
+      - /usr/share/dependency-check/bin/dependency-check.sh --scan "./" --format ALL --project "$CI_PROJECT_NAME" --failOnCVSS 0
+      # Dependency Check will only fail the job based on CVSS scores, and in some cases vulnerabilities do not
+      # have CVSS scores (e.g. those from NPM audit), so they don't cause failure.  To fail for any vulnerabilities
+      # grep the resulting report for any "vulnerabilities" sections and exit if any are found (count > 0).
+      - if [ $(grep -c "vulnerabilities" dependency-check-report.json) -gt 0 ]; then exit 2; fi
+  allow_failure: true
+  artifacts:
+      when: always
+      paths:
+         # Save the HTML and JSON report artifacts
+         - "./dependency-check-report.html"
+         - "./dependency-check-report.json"
+
+
+deploy to heroku:
+  stage: staging
+  image: php:7.2
+  before_script:
+  - apt-get update -qq
+  - apt-get install -y -qq git
+  script:
+  - apt-get install -y ruby
+  - gem install faraday -v 1.9.3
+  - gem install dpl
+  - cp .env.production .env
+  - dpl --provider=heroku --app=$HEROKU_APP_PROD --api-key=$HEROKU_API_KEY
+  environment:  
+    name: QA
+    url: https://$HEROKU_APP_PROD.herokuapp.com/
+
+
+deploy to production:
+  stage: deploying
+  image: php:7.2
+  before_script:
+  - apt-get update -qq
+  - apt-get install -y -qq git
+  script:
+  - apt-get install -y ruby
+  - gem install faraday -v 1.9.3
+  - gem install dpl
+  - dpl --provider=heroku --app=$HEROKU_APP_PROD --api-key=$HEROKU_API_KEY
+  environment:  
+    name: production
+    url: https://$HEROKU_APP_PROD.herokuapp.com/
+  when: manual
+  only: 
+    - master
